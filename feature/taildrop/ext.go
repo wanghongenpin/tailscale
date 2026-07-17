@@ -138,6 +138,20 @@ func (e *Extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// meshpin patch: guard against zero-value LoginProfileView. tsnet's
+	// synthetic "call onChangeProfile once with CurrentProfileState()"
+	// path in Extension.Init hands us a zero View before any real profile
+	// exists; the upstream code jumps straight to profile.UserProfile()
+	// which panics on nil. Reported at
+	// https://github.com/tailscale/tailscale/issues/15974 — this hunk
+	// should be removed once we upgrade to an upstream release that
+	// fixed it (probably >= v1.101).
+	if !profile.Valid() {
+		e.setMgrLocked(nil)
+		e.outgoingFiles = nil
+		return
+	}
+
 	uid := profile.UserProfile().ID()
 	activeLogin := profile.UserProfile().LoginName()
 
@@ -161,6 +175,18 @@ func (e *Extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 		var fileRoot string
 		if fileRoot, isDirectFileMode = e.fileRoot(uid, activeLogin); fileRoot == "" {
 			e.logf("no Taildrop directory configured")
+			e.setMgrLocked(nil)
+			return
+		}
+
+		// meshpin patch: on Android the fileops_fs.go file is excluded
+		// (//go:build !android) so the package-level newFileOps is nil.
+		// Upstream expects the app to call SetFileOps with a SAF-backed
+		// implementation before tsnet starts; when that hasn't happened
+		// we would otherwise dereference a nil function and crash. Fall
+		// back to "no manager" (Taildrop just inactive) instead.
+		if newFileOps == nil {
+			e.logf("taildrop: no FileOps installed; Taildrop disabled")
 			e.setMgrLocked(nil)
 			return
 		}
