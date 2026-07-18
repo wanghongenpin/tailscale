@@ -179,6 +179,7 @@ import (
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/logtail/filch"
+	"tailscale.com/net/dns"
 	"tailscale.com/net/memnet"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/proxymux"
@@ -306,6 +307,14 @@ type Server struct {
 	//
 	// This field must be set before calling Start.
 	Tun tun.Device
+
+	// DNS, if non-nil, overrides the default no-op DNS configurator.
+	// On Android the noop manager can't read /etc/resolv.conf, so the
+	// forward resolver has no upstream resolvers. A custom configurator
+	// that returns system DNS via GetBaseConfig() fixes this.
+	//
+	// This field must be set before calling Start.
+	DNS dns.OSConfigurator
 
 	initOnce            sync.Once
 	initErr             error
@@ -851,6 +860,7 @@ func (s *Server) start() (reterr error) {
 		ListenPort:    s.Port,
 		NetMon:        s.netMon,
 		Dialer:        s.dialer,
+		DNS:           s.DNS,
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
 		HealthTracker: sys.HealthTracker.Get(),
