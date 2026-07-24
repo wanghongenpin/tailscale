@@ -30,8 +30,58 @@ import (
 
 var zaddr netip.Addr
 
+// lookupFallback is consulted by [single] when the platform forward
+// resolver fails or returns no results. meshpin wires this on Android
+// to a Kotlin-provided InetAddress.getAllByName, since neither cgo
+// getaddrinfo nor the Go netgo resolver is reliable for the control
+// plane hostname on gomobile builds. nil is the default and means
+// "no platform fallback available".
+var lookupFallback atomic.Pointer[func(ctx context.Context, host string) ([]netip.Addr, error)]
+
+// globalFallbackHook is consulted by every *Resolver.lookupIP call,
+// regardless of whether the resolver was created via [Get] (the
+// package singleton) or instantiated by other tailscale packages
+// such as control/controlclient. meshpin installs this on Android
+// so the same platform-DNS override is visible to the control plane
+// HTTP client (which builds its own dnscache.Resolver with a
+// dnsfallback HTTPS-based fallback) and to magicsock's peer DERP
+// dials (which share dnscache.Get()).
+var globalFallbackHook atomic.Pointer[func(ctx context.Context, host string) ([]netip.Addr, error)]
+
+// SetLookupFallback installs (or clears, with nil) the platform-level
+// DNS fallback consulted by [Get] when its forward resolver returns
+// no addresses. meshpin calls this on Android during process start.
+func SetLookupFallback(fn func(ctx context.Context, host string) ([]netip.Addr, error)) {
+	if fn == nil {
+		lookupFallback.Store(nil)
+		return
+	}
+	lookupFallback.Store(&fn)
+}
+
+// SetGlobalFallback installs (or clears, with nil) a DNS fallback
+// consulted by every *Resolver.lookupIP call after its forward
+// resolver fails, before any per-Resolver LookupIPFallback runs.
+// meshpin uses this on Android so the same platform-DNS override
+// is visible to controlclient (which uses a private dnscache.Resolver
+// configured with dnsfallback, not the package singleton) and to
+// magicsock.
+func SetGlobalFallback(fn func(ctx context.Context, host string) ([]netip.Addr, error)) {
+	if fn == nil {
+		globalFallbackHook.Store(nil)
+		return
+	}
+	globalFallbackHook.Store(&fn)
+}
+
 var single = &Resolver{
 	Forward: &net.Resolver{PreferGo: preferGoResolver()},
+	LookupIPFallback: func(ctx context.Context, host string) ([]netip.Addr, error) {
+		if p := lookupFallback.Load(); p != nil {
+			return (*p)(ctx, host)
+		}
+		return nil, nil
+	},
 }
 
 func preferGoResolver() bool {
@@ -304,6 +354,20 @@ func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Add
 		if resolver, ok := r.cloudHostResolver(); ok {
 			r.dlogf("resolving %q via cloud resolver", host)
 			ips, err = resolver.LookupNetIP(lookupCtx, "ip", host)
+		}
+	}
+	if err != nil || len(ips) == 0 {
+		// meshpin global hook: runs *before* r.LookupIPFallback so
+		// callers like controlclient (which sets LookupIPFallback to
+		// the DERP-HTTPS bootstrap resolver, useless on networks
+		// without IPv6 to tailscale's anycast) still get a chance
+		// to use Kotlin's InetAddress.getAllByName results. If the
+		// hook returns a non-empty answer, we skip LookupIPFallback
+		// entirely.
+		if p := globalFallbackHook.Load(); p != nil {
+			if got, hErr := (*p)(lookupCtx, host); hErr == nil && len(got) > 0 {
+				ips, err = got, nil
+			}
 		}
 	}
 	if (err != nil || len(ips) == 0) && r.LookupIPFallback != nil {
