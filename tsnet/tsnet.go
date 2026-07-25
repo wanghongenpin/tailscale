@@ -193,11 +193,13 @@ import (
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
 	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
+	"tailscale.com/wgengine/router"
 )
 
 // Server is an embedded Tailscale server.
@@ -315,6 +317,17 @@ type Server struct {
 	//
 	// This field must be set before calling Start.
 	DNS dns.OSConfigurator
+
+	// NewRouter, if non-nil, is a factory that creates an OS router
+	// for the TUN device when running with a real system TUN (as
+	// opposed to the default fake userspace-only mode). When set, it
+	// is called during Start to construct a router.Router that
+	// programmes the host routing table, interface addresses, DNS,
+	// and firewall rules. If nil (the default), tsnet keeps the
+	// no-op fake router.
+	//
+	// This field must be set before calling Start.
+	NewRouter func(logf logger.Logf, dev tun.Device, mon *netmon.Monitor, h *health.Tracker, bus *eventbus.Bus) (router.Router, error)
 
 	initOnce            sync.Once
 	initErr             error
@@ -854,6 +867,16 @@ func (s *Server) start() (reterr error) {
 
 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
 	s.dialer.SetBus(sys.Bus.Get())
+
+	var rtr router.Router
+	if s.NewRouter != nil {
+		var err error
+		rtr, err = s.NewRouter(tsLogf, s.Tun, s.netMon, sys.HealthTracker.Get(), sys.Bus.Get())
+		if err != nil {
+			return fmt.Errorf("NewRouter: %w", err)
+		}
+	}
+
 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
 		Tun:           s.Tun,
 		EventBus:      sys.Bus.Get(),
@@ -861,6 +884,7 @@ func (s *Server) start() (reterr error) {
 		NetMon:        s.netMon,
 		Dialer:        s.dialer,
 		DNS:           s.DNS,
+		Router:        rtr,
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
 		HealthTracker: sys.HealthTracker.Get(),
