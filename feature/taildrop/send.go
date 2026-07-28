@@ -160,8 +160,28 @@ func (m *manager) PutFile(id clientID, baseName string, r io.Reader, offset, len
 	inFile.finalPath = finalPath
 
 	m.totalReceived.Add(1)
+	// [meshpin] Save the sender's StableNodeID as a sidecar file so the
+	// receiver can attribute each file to its sender. clientID is always
+	// the StableNodeID prefixed with "n" (e.g., "n12345CNTRL").
+	writeSenderSidecar(m, baseName, string(id))
 	m.opts.SendFileNotify()
 	return fileLength, nil
+}
+
+// writeSenderSidecar writes a sidecar file containing the sender's
+// StableNodeID so the waiting-files list can attribute each file.
+// clientID is formatted "n<StableNodeID>".
+func writeSenderSidecar(m *manager, baseName, clientIDStr string) {
+	if len(clientIDStr) < 2 || clientIDStr[0] != 'n' {
+		return // unexpected format, skip
+	}
+	wc, _, err := m.opts.fileOps.OpenWriter(baseName+".meshpin-sender", 0, 0o600)
+	if err != nil {
+		return // non-fatal
+	}
+	defer wc.Close()
+	// Strip "n" prefix to get the raw StableNodeID.
+	_, _ = wc.Write([]byte(clientIDStr[1:]))
 }
 
 func (m *manager) redactAndLogError(stage string, err error) error {

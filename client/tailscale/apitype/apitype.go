@@ -52,8 +52,9 @@ type FileTarget struct {
 }
 
 type WaitingFile struct {
-	Name string
-	Size int64
+	Name     string
+	Size     int64
+	SenderID tailcfg.StableNodeID `json:",omitempty"` // meshpin: who sent this file
 }
 
 // SetPushDeviceTokenRequest is the body POSTed to the LocalAPI endpoint /set-device-token.

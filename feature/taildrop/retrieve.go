@@ -11,9 +11,11 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/tailcfg"
 	"tailscale.com/util/backoff"
 	"tailscale.com/util/set"
 )
@@ -78,6 +80,10 @@ func (m *manager) WaitingFiles() ([]apitype.WaitingFile, error) {
 		if isPartialOrDeleted(name) {
 			continue
 		}
+		// Skip meshpin metadata sidecar files — these are not user-facing.
+		if strings.HasSuffix(name, ".meshpin-sender") {
+			continue
+		}
 		// A corresponding .deleted marker means the file was already handled.
 		if _, err := m.opts.fileOps.Stat(name + deletedSuffix); err == nil {
 			continue
@@ -86,13 +92,31 @@ func (m *manager) WaitingFiles() ([]apitype.WaitingFile, error) {
 		if err != nil {
 			continue
 		}
-		ret = append(ret, apitype.WaitingFile{
+		wf := apitype.WaitingFile{
 			Name: name,
 			Size: fi.Size(),
-		})
+		}
+		// Read the sender sidecar if it exists.
+		wf.SenderID = readSenderSidecar(m, name)
+		ret = append(ret, wf)
 	}
 	sort.Slice(ret, func(i, j int) bool { return ret[i].Name < ret[j].Name })
 	return ret, nil
+}
+
+// readSenderSidecar reads the StableNodeID from the .meshpin-sender sidecar
+// file for a given base filename. Returns an empty StableNodeID if none exists.
+func readSenderSidecar(m *manager, baseName string) tailcfg.StableNodeID {
+	rc, err := m.opts.fileOps.OpenReader(baseName + ".meshpin-sender")
+	if err != nil {
+		return ""
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	return tailcfg.StableNodeID(string(b))
 }
 
 // DeleteFile deletes a file of the given baseName from [Handler.Dir].
