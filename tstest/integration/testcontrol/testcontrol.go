@@ -60,14 +60,43 @@ type Server struct {
 	DNSConfig          *tailcfg.DNSConfig // nil means no DNS config
 	MagicDNSDomain     string
 	C2NResponses       syncs.Map[string, func(*http.Response)] // token => onResponse func
+	OnSetDNS           func(*tailcfg.SetDNSRequest) error
 
 	// PeerRelayGrants, if true, inserts relay capabilities into the wildcard
 	// grants rules.
 	PeerRelayGrants bool
 
+	// SSHPolicy, if non-nil, is sent to every node in MapResponses.
+	// Each node also gets [tailcfg.CapabilitySSH] added to its capability
+	// map, permitting "tailscale up --ssh".
+	SSHPolicy *tailcfg.SSHPolicy
+
 	// AllNodesSameUser, if true, makes all created nodes
 	// belong to the same user.
 	AllNodesSameUser bool
+
+	// TagOwners, if non-nil, enables modeling of the production control
+	// server's tag transition handling. Map keys are tags (e.g. "tag:foo")
+	// and values are the tags whose nodes are allowed to assign the key's
+	// tag. A node registering with Hostinfo.RequestTags gets those tags
+	// (signup-time ownership checks are not modeled). A later non-streaming
+	// map request whose Hostinfo.RequestTags differ from both the node's
+	// stored Hostinfo's RequestTags and its current tags is treated as a
+	// tag transition request: if the node's current tags own each requested
+	// tag, the node is retagged; otherwise its node key is expired to force
+	// reauthentication, as the production control server does.
+	//
+	// If nil, RequestTags in map requests are ignored.
+	TagOwners map[string][]string
+
+	// HoldMapRequest, if non-nil, is called with each incoming MapRequest
+	// before the server starts processing it. It may block to delay
+	// processing, letting tests control the order in which concurrent map
+	// requests are handled. If it returns a non-nil func, the server calls
+	// it when it finishes handling the request. For streaming requests
+	// that is when the poll ends, so returning a done func is mostly
+	// useful for non-streaming requests.
+	HoldMapRequest func(*tailcfg.MapRequest) (done func())
 
 	// AllOnline, if true, marks every peer entry in MapResponses as
 	// Online=true. This is a coarse stand-in for the per-node
@@ -379,6 +408,7 @@ func (s *Server) initMux() {
 	})
 	s.mux.HandleFunc("/key", s.serveKey)
 	s.mux.HandleFunc("/machine/tka/", s.serveTKA)
+	s.mux.HandleFunc("/machine/webclient/", s.serveWebClient)
 	s.mux.HandleFunc("/machine/", s.serveMachine)
 	s.mux.HandleFunc("/ts2021", s.serveNoiseUpgrade)
 	s.mux.HandleFunc("/c2n/", s.serveC2N)
@@ -508,12 +538,103 @@ func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
 		s.serveMap(w, r, mkey)
 	case "/machine/register":
 		s.serveRegister(w, r, mkey)
+	case "/machine/set-dns":
+		s.serveSetDNS(w, r, mkey)
 	case "/machine/update-health":
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		s.serveUnhandled(w, r)
 	}
+}
+
+// serveWebClient handles the Noise-protected web client auth flow endpoints
+// posted to /machine/webclient/init/<src>/to/<dst> and
+// /machine/webclient/wait/<src>/to/<dst>/<id>. It is the test-control
+// counterpart to client/web's check-mode session creation: it returns a
+// placeholder auth URL for init, and immediately Complete=true for wait, so
+// tests can drive the full check-mode session lifecycle without a real
+// browser-click loop.
+func (s *Server) serveWebClient(w http.ResponseWriter, r *http.Request) {
+	if r.Method != httpm.POST {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var resp tailcfg.WebClientAuthResponse
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/machine/webclient/init/"):
+		resp.ID = "testcontrol-webclient-auth"
+		resp.URL = "https://control.tailscale/test-web-auth"
+	case strings.HasPrefix(r.URL.Path, "/machine/webclient/wait/"):
+		resp.Complete = true
+	default:
+		s.serveUnhandled(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("testcontrol: encoding web client response: %v", err)
+	}
+}
+
+func (s *Server) serveSetDNS(w http.ResponseWriter, r *http.Request, mkey key.MachinePublic) {
+	var req tailcfg.SetDNSRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Type != "TXT" {
+		http.Error(w, "only TXT records are supported", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" || req.Value == "" {
+		http.Error(w, "missing name or value", http.StatusBadRequest)
+		return
+	}
+	if req.NodeKey.IsZero() {
+		http.Error(w, "missing node key", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	node := s.nodes[req.NodeKey]
+	certDomains := s.certDomainsLocked(node)
+	s.mu.Unlock()
+	if node == nil {
+		http.Error(w, "unknown node key", http.StatusForbidden)
+		return
+	}
+	if node.Machine != mkey {
+		http.Error(w, "node key does not belong to machine", http.StatusForbidden)
+		return
+	}
+	baseName, ok := strings.CutPrefix(req.Name, "_acme-challenge.")
+	if !ok || !slices.Contains(certDomains, baseName) {
+		http.Error(w, "name is not an ACME challenge for a cert domain", http.StatusForbidden)
+		return
+	}
+	if s.OnSetDNS != nil {
+		if err := s.OnSetDNS(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tailcfg.SetDNSResponse{})
+}
+
+func (s *Server) certDomainsLocked(node *tailcfg.Node) []string {
+	if node == nil {
+		return nil
+	}
+	var ret []string
+	if s.DNSConfig != nil {
+		ret = append(ret, s.DNSConfig.CertDomains...)
+	}
+	if s.MagicDNSDomain != "" {
+		ret = append(ret, node.Hostinfo.Hostname()+"."+s.MagicDNSDomain)
+	}
+	return ret
 }
 
 // SetSubnetRoutes sets the list of subnet routes which a node is routing.
@@ -847,7 +968,8 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 	}
 
 	// If this is a followup request, wait until interactive followup URL visit complete.
-	if req.Followup != "" {
+	isFollowup := req.Followup != ""
+	if isFollowup {
 		followupURL, err := url.Parse(req.Followup)
 		if err != nil {
 			panic(err)
@@ -863,18 +985,22 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 		// some follow-ups? For now all are successes.
 	}
 
-	// The in-memory list of nodes, users, and logins is keyed by
-	// the node key.  If the node key changes, update all the data stores
-	// to use the new node key.
+	// On a key rotation (OldNodeKey set and known to s.nodes), stage
+	// the new key as a candidate entry but keep the old key's entry
+	// alive so an in-flight map poll can still receive updates while
+	// the user completes the auth URL.
 	s.mu.Lock()
 	if _, oldNodeKeyOk := s.nodes[req.OldNodeKey]; oldNodeKeyOk {
 		if _, newNodeKeyOk := s.nodes[req.NodeKey]; !newNodeKeyOk {
-			s.nodes[req.OldNodeKey].Key = req.NodeKey
-			s.nodes[req.NodeKey] = s.nodes[req.OldNodeKey]
-
+			cloned := s.nodes[req.OldNodeKey].Clone()
+			cloned.Key = req.NodeKey
+			s.nodes[req.NodeKey] = cloned
 			s.users[req.NodeKey] = s.users[req.OldNodeKey]
 			s.logins[req.NodeKey] = s.logins[req.OldNodeKey]
-
+		}
+		if isFollowup {
+			// The user has completed the auth URL, the new key
+			// is now authoritative. Retire the old key's entry.
 			delete(s.nodes, req.OldNodeKey)
 			delete(s.users, req.OldNodeKey)
 			delete(s.logins, req.OldNodeKey)
@@ -929,16 +1055,29 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 			CapMap:            capMap,
 			Capabilities:      slices.Collect(maps.Keys(capMap)),
 		}
+		if s.TagOwners != nil && req.Hostinfo != nil {
+			// Trust the requested tags at signup; ownership checks
+			// against the registering user are not modeled.
+			node.Tags = slices.Clone(req.Hostinfo.RequestTags)
+		}
 		if s.MagicDNSDomain != "" {
 			node.Name = node.Name + "." + s.MagicDNSDomain + "."
 		}
 		s.nodes[nk] = node
 	}
+	// Consider a node key expired if allExpired is set or if the nodeKey has
+	// an expiry time in the past. This allows tests to set per-node KeyExpiry
+	// via UpdateNode to simulate an admin-triggered or time-based expiry.
+	nodeKeyExpired := s.allExpired
+	if !nodeKeyExpired && req.OldNodeKey.IsZero() {
+		if n, ok := s.nodes[nk]; ok && !n.KeyExpiry.IsZero() && n.KeyExpiry.Before(time.Now()) {
+			nodeKeyExpired = true
+		}
+	}
 	requireAuth := s.RequireAuth
-	if requireAuth && s.nodeKeyAuthed.Contains(nk) {
+	if requireAuth && s.nodeKeyAuthed.Contains(nk) && !nodeKeyExpired {
 		requireAuth = false
 	}
-	allExpired := s.allExpired
 	s.mu.Unlock()
 
 	authURL := ""
@@ -951,7 +1090,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 	res, err := s.encode(false, tailcfg.RegisterResponse{
 		User:              *user,
 		Login:             *login,
-		NodeKeyExpired:    allExpired,
+		NodeKeyExpired:    nodeKeyExpired,
 		MachineAuthorized: machineAuthorized,
 		AuthURL:           authURL,
 	})
@@ -1152,6 +1291,71 @@ func (s *Server) incrInServeMap(delta int) {
 	s.inServeMap += delta
 }
 
+// handleTagTransitionLocked models the production control server's handling
+// of tag changes requested via Hostinfo.RequestTags in non-streaming map
+// requests (see updateTags in the control server). A request whose
+// RequestTags differ from both the node's stored Hostinfo's RequestTags and
+// the node's current tags is a tag transition request. If the transition is
+// permitted by s.TagOwners, the node is retagged; otherwise its node key is
+// expired to force reauthentication.
+//
+// hi is the Hostinfo from the incoming request; node.Hostinfo is the
+// previously stored one. s.mu must be held.
+func (s *Server) handleTagTransitionLocked(node *tailcfg.Node, hi tailcfg.HostinfoView) {
+	var oldReqTags []string
+	if node.Hostinfo.Valid() {
+		oldReqTags = node.Hostinfo.RequestTags().AsSlice()
+	}
+	newReqTags := hi.RequestTags().AsSlice()
+	if tagsEqualAnyOrder(oldReqTags, newReqTags) || tagsEqualAnyOrder(newReqTags, node.Tags) {
+		return
+	}
+	if s.validTagTransition(node.Tags, newReqTags) {
+		s.logf("testcontrol: retagging node %v: %v -> %v", node.ID, node.Tags, newReqTags)
+		node.Tags = newReqTags
+	} else {
+		s.logf("testcontrol: invalid tag transition %v -> %v for node %v; expiring its node key", node.Tags, newReqTags, node.ID)
+		node.KeyExpiry = time.Now().Add(-time.Minute)
+	}
+}
+
+// validTagTransition reports whether a node currently tagged cur may retag
+// itself as want, per s.TagOwners: every requested tag must be owned by one
+// of the node's current tags. An untagged node may claim any defined tag,
+// standing in for the production server's checks against the requesting
+// user, which this server doesn't model. Removing all tags is not allowed,
+// matching the production server.
+func (s *Server) validTagTransition(cur, want []string) bool {
+	if len(want) == 0 {
+		return len(cur) == 0
+	}
+	for _, tag := range want {
+		owners, ok := s.TagOwners[tag]
+		if !ok {
+			return false
+		}
+		if len(cur) == 0 {
+			continue
+		}
+		owned := slices.ContainsFunc(cur, func(c string) bool { return slices.Contains(owners, c) })
+		if !owned {
+			return false
+		}
+	}
+	return true
+}
+
+// tagsEqualAnyOrder reports whether a and b contain the same tags, ignoring order.
+func tagsEqualAnyOrder(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	as, bs := slices.Clone(a), slices.Clone(b)
+	slices.Sort(as)
+	slices.Sort(bs)
+	return slices.Equal(as, bs)
+}
+
 // InServeMap returns the number of clients currently in a MapRequest HTTP handler.
 func (s *Server) InServeMap() int {
 	s.mu.Lock()
@@ -1182,6 +1386,12 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 		s.onMapRequest(req.NodeKey)
 	}
 	s.mu.Unlock()
+
+	if s.HoldMapRequest != nil {
+		if done := s.HoldMapRequest(req); done != nil {
+			defer done()
+		}
+	}
 
 	if s.AltMapStream != nil {
 		// The caller takes over the stream entirely; it must handle
@@ -1214,6 +1424,16 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 	streamingNonUpdate := req.Stream && req.Version >= 68
 	var peersToUpdate []tailcfg.NodeID
 	if !req.ReadOnly && !streamingNonUpdate {
+		if ctx.Err() != nil {
+			// The client canceled the request (say, its control client
+			// was shut down mid-request when "tailscale up" or a
+			// profile switch created a new one), so its contents may
+			// predate newer requests that were already processed.
+			// Don't apply its Hostinfo/endpoints; they may be stale.
+			s.logf("testcontrol: dropping canceled map update from %v", req.NodeKey.ShortString())
+			http.Error(w, "request canceled", 400)
+			return
+		}
 		endpoints := filterInvalidIPv6Endpoints(req.Endpoints)
 		var hi tailcfg.HostinfoView
 		var newDERP int
@@ -1233,6 +1453,9 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 			live.DiscoKey = req.DiscoKey
 			live.Cap = req.Version
 			if hi.Valid() {
+				if s.TagOwners != nil {
+					s.handleTagTransitionLocked(live, hi)
+				}
 				live.Hostinfo = hi
 				if newDERP != 0 {
 					live.HomeDERP = newDERP
@@ -1394,10 +1617,14 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 		dns = s.DNSConfig.Clone()
 	}
 	magicDNSDomain := s.MagicDNSDomain
+	sshPolicy := s.SSHPolicy.Clone()
 	s.mu.Unlock()
 
 	node.CapMap = nodeCapMap
 	node.Capabilities = append(node.Capabilities, tailcfg.NodeAttrDisableUPnP)
+	if sshPolicy != nil {
+		mak.Set(&node.CapMap, tailcfg.CapabilitySSH, nil)
+	}
 
 	t := time.Date(2020, 8, 3, 0, 0, 0, 1, time.UTC)
 	if dns != nil && magicDNSDomain != "" {
@@ -1411,6 +1638,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 		CollectServices: cmp.Or(s.CollectServices, opt.True),
 		PacketFilter:    packetFilterWithIngress(s.PeerRelayGrants),
 		DNSConfig:       dns,
+		SSHPolicy:       sshPolicy,
 		ControlTime:     &t,
 	}
 
