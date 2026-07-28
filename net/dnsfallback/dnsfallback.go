@@ -90,16 +90,18 @@ func lookup(ctx context.Context, host string, logf logger.Logf, ht *health.Track
 	slicesx.Shuffle(cands6)
 
 	const maxCands = 6
-	var cands []nameIP // up to maxCands alternating v4/v6 as long as we have both
-	for (len(cands4) > 0 || len(cands6) > 0) && len(cands) < maxCands {
-		if len(cands4) > 0 {
-			cands = append(cands, cands4[0])
-			cands4 = cands4[1:]
-		}
-		if len(cands6) > 0 {
-			cands = append(cands, cands6[0])
-			cands6 = cands6[1:]
-		}
+	// Try all IPv4 candidates first, then IPv6. This avoids wasting
+	// attempts on unreachable IPv6 addresses on networks without IPv6
+	// (common on Android mobile carriers that assign IPv6 addresses
+	// without a working IPv6 route).
+	var cands []nameIP
+	for len(cands4) > 0 && len(cands) < maxCands {
+		cands = append(cands, cands4[0])
+		cands4 = cands4[1:]
+	}
+	for len(cands6) > 0 && len(cands) < maxCands {
+		cands = append(cands, cands6[0])
+		cands6 = cands6[1:]
 	}
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("no DNS fallback options for %q", host)
