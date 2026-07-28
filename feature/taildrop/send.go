@@ -161,8 +161,7 @@ func (m *manager) PutFile(id clientID, baseName string, r io.Reader, offset, len
 
 	m.totalReceived.Add(1)
 	// [meshpin] Save the sender's StableNodeID as a sidecar file so the
-	// receiver can attribute each file to its sender. clientID is always
-	// the StableNodeID prefixed with "n" (e.g., "n12345CNTRL").
+	// receiver can attribute each file to its sender.
 	writeSenderSidecar(m, baseName, string(id))
 	m.opts.SendFileNotify()
 	return fileLength, nil
@@ -170,18 +169,24 @@ func (m *manager) PutFile(id clientID, baseName string, r io.Reader, offset, len
 
 // writeSenderSidecar writes a sidecar file containing the sender's
 // StableNodeID so the waiting-files list can attribute each file.
-// clientID is formatted "n<StableNodeID>".
+// clientID may be "n<StableNodeID>" (Tailscale SaaS) or a bare
+// StableNodeID (Headscale / self-hosted).
 func writeSenderSidecar(m *manager, baseName, clientIDStr string) {
-	if len(clientIDStr) < 2 || clientIDStr[0] != 'n' {
-		return // unexpected format, skip
+	if len(clientIDStr) == 0 {
+		return
+	}
+	// Strip "n" prefix if present (Tailscale SaaS format), otherwise
+	// use the whole string as-is (Headscale numeric IDs, etc.).
+	senderID := clientIDStr
+	if senderID[0] == 'n' {
+		senderID = senderID[1:]
 	}
 	wc, _, err := m.opts.fileOps.OpenWriter(baseName+".meshpin-sender", 0, 0o600)
 	if err != nil {
 		return // non-fatal
 	}
 	defer wc.Close()
-	// Strip "n" prefix to get the raw StableNodeID.
-	_, _ = wc.Write([]byte(clientIDStr[1:]))
+	wc.Write([]byte(senderID))
 }
 
 func (m *manager) redactAndLogError(stage string, err error) error {
