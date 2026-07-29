@@ -487,6 +487,30 @@ func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report, pre
 			do6 = false
 		}
 
+		// MeshPin local patch: on dual-stack clients, always keep probing
+		// IPv6 on any v6-capable region, even when the home region is
+		// IPv4-only. Our self-hosted hz-1a is IPv4-only; when it wins the
+		// home slot it otherwise starves IPv6 probing during incremental
+		// netchecks, so the client stops discovering/advertising its own
+		// v6 endpoint and v6 direct connect silently breaks. Keeping v6
+		// probing alive is what lets us drop NoMeasureNoHome from the DERP
+		// map so hz-1a can serve as a low-latency home/relay again.
+		//
+		// v4-only nodes are marked ipv6:"none" in the DERP map, so
+		// nodeMight6 returns false for them and they are skipped here —
+		// we never emit useless v6 STUN probes against them. Only regions
+		// with a real v6-capable node re-enable do6.
+		//
+		// Re-apply after upstream sync.
+		if have6if {
+			for _, n := range reg.Nodes {
+				if n.IPv6 != "none" && nodeMight6(n) {
+					do6 = true
+					break
+				}
+			}
+		}
+
 		if regIsHome {
 			// But if we already had a DERP home, try extra hard to
 			// make sure it's there so we don't flip flop around.
