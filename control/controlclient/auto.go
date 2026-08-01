@@ -839,6 +839,19 @@ func (c *Auto) Login(flags LoginFlags) {
 		panic("tainted client")
 	}
 	c.wantLoggedIn = true
+
+	// If a login is already in progress (goal is non-nil and we're not
+	// waiting for the user to visit a URL), just upgrade the flags
+	// in-place instead of cancelling the in-flight request. This prevents
+	// "context canceled" errors when StartLoginInteractive upgrades a
+	// state-machine-triggered login to interactive (LoginInteractive
+	// flag) while the first TryLogin HTTP request is still in flight.
+	if c.loginGoal != nil && c.loginGoal.url == "" {
+		c.loginGoal.flags = flags
+		c.cancelMapCtxLocked()
+		return
+	}
+
 	c.loginGoal = &LoginGoal{
 		flags: flags,
 	}
