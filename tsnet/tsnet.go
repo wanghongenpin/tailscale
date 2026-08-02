@@ -1284,7 +1284,16 @@ func (s *Server) getTCPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 				return connHandler, intercept
 			}
 		}
-		return nil, true // don't handle, don't forward to localhost
+		// When a TUN device is present the caller has enabled
+		// CheckLocalTransportEndpoints, so returning (nil,
+		// false) lets unmatched flows pass through to the TUN
+		// device and reach the OS kernel's own services
+		// (e.g. Windows RDP on :3389). Without a TUN we must
+		// reject — there is no fallback path to the host.
+		if s.Tun != nil {
+			return nil, false
+		}
+		return nil, true
 	}
 	return ln.handle, true
 }
@@ -1292,7 +1301,10 @@ func (s *Server) getTCPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
 	ln, ok := s.listenerForDstAddr("udp", dst, false)
 	if !ok {
-		return nil, true // don't handle, don't forward to localhost
+		if s.Tun != nil {
+			return nil, false
+		}
+		return nil, true
 	}
 	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
 }
