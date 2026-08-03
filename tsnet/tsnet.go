@@ -330,6 +330,30 @@ type Server struct {
 	// This field must be set before calling Start.
 	NewRouter func(logf logger.Logf, dev tun.Device, mon *netmon.Monitor, h *health.Tracker, bus *eventbus.Bus) (router.Router, error)
 
+	// ForwardUnclaimedTCP, if non-nil, is consulted for an inbound TCP
+	// flow that matched no listener and that no fallback handler
+	// claimed. Returning true makes tsnet decline to intercept, which
+	// lets netstack's own forwardTCP dial the destination with the
+	// host's dialer and splice the two ends together.
+	//
+	// This exists for exit-node service. In userspace mode (Tun == nil)
+	// tsnet otherwise rejects such flows with a RST, on the reasoning
+	// that without a TUN there is no path to the host. That is right for
+	// a plain userspace node but wrong for an exit node, whose entire
+	// job is to relay a peer's internet-bound traffic out through the
+	// host — netstack's forwardTCP is exactly that path. Without this
+	// hook an exit node RSTs every connection a peer sends it, and the
+	// peer sees "connection refused" with nothing logged on either side
+	// to explain it.
+	//
+	// Keep it conservative: return true only for destinations this node
+	// really is serving as an exit node, since every true also hands the
+	// caller's chosen address to the host dialer.
+	//
+	// This field must be set before calling Start. It is a meshpin-local
+	// addition, not upstream tailscale API.
+	ForwardUnclaimedTCP func(src, dst netip.AddrPort) bool
+
 	initOnce            sync.Once
 	initErr             error
 	lb                  *ipnlocal.LocalBackend
@@ -383,6 +407,72 @@ func (s *Server) Dial(ctx context.Context, network, address string) (net.Conn, e
 		return nil, err
 	}
 	return s.dialer.UserDial(ctx, network, address)
+}
+
+// DialNetstack connects to addr through netstack, bypassing the
+// route-table consultation that [Server.Dial] performs.
+//
+// [Server.Dial] routes via [tsdial.Dialer.UserDial], which decides
+// between netstack and a host dialer by consulting the prefixes handed
+// to SetRoutes — and those come from the *OS* route set
+// (router.Config.Routes). An embedder that supplies its own TUN and
+// leaves NewRouter nil gets router.NewFake, so that set never contains
+// the selected exit node's 0.0.0.0/0/::/0 and UserDial falls through to
+// the host dialer. Traffic then leaves on the physical interface with
+// the host's source address, silently bypassing the exit node.
+//
+// This entry point exists for embedders that manage OS routes
+// themselves (installing them from a privileged helper, say) and so
+// cannot rely on tsnet's view of the OS routing table. Packets are
+// injected into netstack and routed by netstack's own table, which does
+// carry the exit node's default routes, so egress follows the exit node.
+//
+// network must be "tcp", "tcp4", or "tcp6". addr must be an IP:port —
+// no name resolution is performed, because a name would have to be
+// resolved through the exit node's DNS to avoid leaking the query.
+//
+// This is a meshpin-local addition, not upstream tailscale API.
+func (s *Server) DialNetstack(ctx context.Context, network, addr string) (net.Conn, error) {
+	if err := s.Start(); err != nil {
+		return nil, err
+	}
+	if err := s.awaitRunning(ctx); err != nil {
+		return nil, err
+	}
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return nil, fmt.Errorf("DialNetstack: unsupported network %q", network)
+	}
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("DialNetstack: addr must be IP:port: %w", err)
+	}
+	if s.dialer.NetstackDialTCP == nil {
+		return nil, errors.New("DialNetstack: netstack not initialized")
+	}
+	return s.dialer.NetstackDialTCP(ctx, ap)
+}
+
+// ResolveForDial resolves addr (host:port or IP:port) the same way
+// [Server.Dial] would, and reports whether tsnet's own routing view
+// considers the result reachable over Tailscale.
+//
+// Callers that intend to dial via [Server.DialNetstack] should use this
+// to resolve first: it goes through tsnet's resolver, so MagicDNS names
+// work and — when an exit node with DoH is selected — the query itself
+// travels through the exit node instead of leaking to the local
+// network's resolver.
+//
+// This is a meshpin-local addition, not upstream tailscale API.
+func (s *Server) ResolveForDial(ctx context.Context, network, addr string) (ipp netip.AddrPort, viaTailscale bool, err error) {
+	if err := s.Start(); err != nil {
+		return netip.AddrPort{}, false, err
+	}
+	if err := s.awaitRunning(ctx); err != nil {
+		return netip.AddrPort{}, false, err
+	}
+	return s.dialer.UserDialPlan(ctx, network, addr)
 }
 
 // awaitRunning waits until the backend is in state Running.
@@ -1291,6 +1381,12 @@ func (s *Server) getTCPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 		// (e.g. Windows RDP on :3389). Without a TUN we must
 		// reject — there is no fallback path to the host.
 		if s.Tun != nil {
+			return nil, false
+		}
+		// ...except when acting as an exit node: netstack's forwardTCP
+		// is a path to the host, and relaying the peer's traffic out
+		// through it is the whole point. See ForwardUnclaimedTCP.
+		if s.ForwardUnclaimedTCP != nil && s.ForwardUnclaimedTCP(src, dst) {
 			return nil, false
 		}
 		return nil, true
