@@ -354,6 +354,21 @@ type Server struct {
 	// addition, not upstream tailscale API.
 	ForwardUnclaimedTCP func(src, dst netip.AddrPort) bool
 
+	// ForwardTCPDialTimeout bounds how long netstack waits for the
+	// outbound dial when forwarding an unclaimed TCP flow (exit-node
+	// egress, subnet-router forwarding). Zero leaves netstack's
+	// default, which is to let the dial run until the OS abandons its
+	// own SYN retry schedule.
+	//
+	// Set this whenever the destination is chosen by a peer rather
+	// than by this process: an unreachable address then costs the
+	// peer a full OS connect timeout with no signal, instead of a
+	// prompt failure it can retry or report.
+	//
+	// This field must be set before calling Start. It is a
+	// meshpin-local addition, not upstream tailscale API.
+	ForwardTCPDialTimeout time.Duration
+
 	initOnce            sync.Once
 	initErr             error
 	lb                  *ipnlocal.LocalBackend
@@ -1016,6 +1031,7 @@ func (s *Server) start() (reterr error) {
 	}
 	ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
 	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
+	ns.ForwardTCPDialTimeout = s.ForwardTCPDialTimeout
 	s.netstack = ns
 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 		// s.lb is assigned below, before any dials can happen.

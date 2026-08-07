@@ -206,6 +206,24 @@ type Impl struct {
 	// It can only be set before calling Start.
 	ProcessSubnets bool
 
+	// ForwardTCPDialTimeout bounds how long forwardTCP waits for the
+	// outbound dial to the destination to complete. Zero means no
+	// explicit bound, in which case the dial runs until the OS gives
+	// up on its own SYN retry schedule (~21s on Windows).
+	//
+	// This matters for exit nodes and subnet routers, where the
+	// destination is chosen by the *peer*, not by this node: any
+	// address the peer picks that this node cannot reach costs a full
+	// OS-level connect timeout, during which the peer's connection
+	// simply hangs before finally getting a RST. A destination worth
+	// reaching answers a SYN in well under a second, so failing fast
+	// loses nothing and turns a 21s stall into a prompt error the
+	// peer's application can act on.
+	//
+	// It can only be set before calling Start. This is a meshpin-local
+	// addition, not upstream tailscale API.
+	ForwardTCPDialTimeout time.Duration
+
 	ipstack   *stack.Stack
 	linkEP    *linkEndpoint
 	tundev    *tstun.Wrapper
@@ -243,13 +261,6 @@ type Impl struct {
 	atomicIPVIPServiceMap syncs.AtomicValue[netmap.IPServiceMappings]
 	// make this a set of strings for faster lookup
 	atomicActiveVIPServices syncs.AtomicValue[set.Set[tailcfg.ServiceName]]
-
-	// forwardTCPLogLast rate-limits "could not connect to local backend
-	// server" logs from forwardTCP — an IPv6-only destination that the
-	// host can't reach (no IPv6 route) fires this for every SYN, but the
-	// peer's Happy Eyeballs will try IPv4 next and the failure is
-	// harmless. Logging at full rate creates log-spam.
-	forwardTCPLogLast time.Time
 
 	// forwardDialFunc, if non-nil, is the net.Dialer.DialContext-style
 	// function that is used to make outgoing connections when forwarding a
@@ -1756,12 +1767,25 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 
 	// TODO: this is racy, dialing before we register our local address. See
 	// https://github.com/tailscale/tailscale/issues/1616.
-	backend, err := dialFunc(ctx, "tcp", dialAddrStr)
+	//
+	// Bound the dial when the caller asked for it. The ctx above is only
+	// cancelled on HUP or when this func returns, so without a deadline a
+	// black-holed destination holds the peer's connection open for the
+	// OS's full SYN retry schedule. See ForwardTCPDialTimeout.
+	dialCtx := ctx
+	if ns.ForwardTCPDialTimeout > 0 {
+		var cancelDial context.CancelFunc
+		dialCtx, cancelDial = context.WithTimeout(ctx, ns.ForwardTCPDialTimeout)
+		defer cancelDial()
+	}
+	backend, err := dialFunc(dialCtx, "tcp", dialAddrStr)
 	if err != nil {
-		if time.Since(ns.forwardTCPLogLast) > 10*time.Second {
-			ns.logf("netstack: could not connect to local backend server at %s: %v", dialAddr.String(), err)
-			ns.forwardTCPLogLast = time.Now()
-		}
+		// Deliberately unthrottled here. This runs one goroutine per
+		// accepted flow, so any rate-limit state on ns would need a
+		// mutex to be correct; meshpin instead collapses repeats in its
+		// own logf sink (see logThrottle in native/tsbridge), which is
+		// keyed per format string and properly synchronized.
+		ns.logf("netstack: could not connect to local backend server at %s: %v", dialAddr.String(), err)
 		return
 	}
 	defer backend.Close()
