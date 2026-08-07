@@ -1005,6 +1005,14 @@ func (s *Server) start() (reterr error) {
 		// When using a TUN, check gVisor for registered endpoints to handle
 		// packets for tsnet listeners and outbound connection replies.
 		ns.CheckLocalTransportEndpoints = true
+		// Process subnets in netstack even with a TUN so exit-node
+		// forwarding gets userspace NAT via forwardTCP. Without this,
+		// exit-node traffic from a peer is handed to the OS kernel,
+		// which has no NAT on macOS / no winnat setup on Windows
+		// through tsnet's minimal router. Matching cmd/tailscaled
+		// behaviour: handleSubnetsInNetstack() returns true on all
+		// desktop platforms.
+		ns.ProcessSubnets = true
 	}
 	ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
 	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow

@@ -244,6 +244,13 @@ type Impl struct {
 	// make this a set of strings for faster lookup
 	atomicActiveVIPServices syncs.AtomicValue[set.Set[tailcfg.ServiceName]]
 
+	// forwardTCPLogLast rate-limits "could not connect to local backend
+	// server" logs from forwardTCP — an IPv6-only destination that the
+	// host can't reach (no IPv6 route) fires this for every SYN, but the
+	// peer's Happy Eyeballs will try IPv4 next and the failure is
+	// harmless. Logging at full rate creates log-spam.
+	forwardTCPLogLast time.Time
+
 	// forwardDialFunc, if non-nil, is the net.Dialer.DialContext-style
 	// function that is used to make outgoing connections when forwarding a
 	// TCP connection to another host (e.g. in subnet router mode).
@@ -1751,7 +1758,10 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 	// https://github.com/tailscale/tailscale/issues/1616.
 	backend, err := dialFunc(ctx, "tcp", dialAddrStr)
 	if err != nil {
-		ns.logf("netstack: could not connect to local backend server at %s: %v", dialAddr.String(), err)
+		if time.Since(ns.forwardTCPLogLast) > 10*time.Second {
+			ns.logf("netstack: could not connect to local backend server at %s: %v", dialAddr.String(), err)
+			ns.forwardTCPLogLast = time.Now()
+		}
 		return
 	}
 	defer backend.Close()
