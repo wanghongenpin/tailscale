@@ -354,6 +354,21 @@ type Server struct {
 	// addition, not upstream tailscale API.
 	ForwardUnclaimedTCP func(src, dst netip.AddrPort) bool
 
+	// ForwardTCPDialTimeout bounds the outbound dial netstack makes
+	// when forwarding a flow on a peer's behalf (exit-node egress,
+	// subnet routing). A zero value means no timeout — netstack dials
+	// on a context that is only cancelled on client disconnect,
+	// which can burn the OS's full SYN retry budget (~21s on Windows)
+	// for an unreachable destination.
+	//
+	// A reachable host answers a SYN in tens of milliseconds, so even a
+	// short value (e.g. 5s) costs nothing for valid destinations while
+	// giving the peer a prompt, actionable failure for the dead ones.
+	//
+	// This field must be set before calling Start. It is a meshpin-local
+	// addition, not upstream tailscale API.
+	ForwardTCPDialTimeout time.Duration
+
 	initOnce            sync.Once
 	initErr             error
 	lb                  *ipnlocal.LocalBackend
@@ -1016,6 +1031,7 @@ func (s *Server) start() (reterr error) {
 	}
 	ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
 	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
+	ns.ForwardTCPDialTimeout = s.ForwardTCPDialTimeout
 	s.netstack = ns
 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 		// s.lb is assigned below, before any dials can happen.
@@ -1382,24 +1398,35 @@ func (s *Server) getTCPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 				return connHandler, intercept
 			}
 		}
-		// When a TUN device is present the caller has enabled
-		// CheckLocalTransportEndpoints, so returning (nil,
-		// false) lets unmatched flows pass through to the TUN
-		// device and reach the OS kernel's own services
-		// (e.g. Windows RDP on :3389). Without a TUN we must
-		// reject — there is no fallback path to the host.
-		if s.Tun != nil {
-			return nil, false
-		}
-		// ...except when acting as an exit node: netstack's forwardTCP
-		// is a path to the host, and relaying the peer's traffic out
-		// through it is the whole point. See ForwardUnclaimedTCP.
-		if s.ForwardUnclaimedTCP != nil && s.ForwardUnclaimedTCP(src, dst) {
-			return nil, false
-		}
-		return nil, true
+		return nil, s.unmatchedTCPFlowIntercept(src, dst)
 	}
 	return ln.handle, true
+}
+
+// unmatchedTCPFlowIntercept reports the intercept value [Server.getTCPHandlerForFlow]
+// should return for an inbound TCP flow that matched no listener and no fallback
+// handler.
+//
+// When a TUN device is present the caller has enabled
+// CheckLocalTransportEndpoints, so declining to intercept lets unmatched flows
+// pass through to the TUN device and reach the OS kernel's own services (e.g.
+// Windows RDP on :3389). Without a TUN there is no fallback path to the host, so
+// the flow must be intercepted (and RST'd)...
+//
+// ...except when acting as an exit node: netstack's forwardTCP is a path to the
+// host, and relaying the peer's traffic out through it is the whole point. See
+// [Server.ForwardUnclaimedTCP].
+//
+// The hook is evaluated before the s.Tun test rather than being short-circuited
+// by it: an `s.Tun != nil || hook(...)` expression would never call the hook on
+// a system-TUN platform (macOS, Windows), leaving the exit-node gate it
+// implements as dead code. Both conditions decline to intercept, so consulting
+// the hook here changes no return value — it just keeps the gate live.
+//
+// This is a meshpin-local addition, not upstream tailscale API.
+func (s *Server) unmatchedTCPFlowIntercept(src, dst netip.AddrPort) bool {
+	forwardAsExitNode := s.ForwardUnclaimedTCP != nil && s.ForwardUnclaimedTCP(src, dst)
+	return s.Tun == nil && !forwardAsExitNode
 }
 
 func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {

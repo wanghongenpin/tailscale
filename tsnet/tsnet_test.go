@@ -3905,3 +3905,105 @@ func TestListenMultipleEphemeralPorts(t *testing.T) {
 		testMultipleEphemeral(t, lt)
 	})
 }
+
+// TestUnmatchedTCPFlowIntercept covers the exit-node gate for inbound TCP flows
+// that matched no listener and no fallback handler.
+//
+// The regression this pins down: ForwardUnclaimedTCP used to sit behind an
+// early `if s.Tun != nil { return nil, false }`, so on a system-TUN platform
+// (macOS, Windows) the hook was never called and the exit-node gate it
+// implements was dead code. Asserting on the return value alone cannot catch
+// that — both branches decline to intercept — so this also asserts the hook
+// was actually consulted.
+func TestUnmatchedTCPFlowIntercept(t *testing.T) {
+	src := netip.MustParseAddrPort("100.64.0.5:1234")
+	dst := netip.MustParseAddrPort("8.8.8.8:443")
+
+	tests := []struct {
+		name          string
+		withTUN       bool
+		hook          func(src, dst netip.AddrPort) bool // nil means unset
+		wantIntercept bool
+		wantHookCall  bool
+	}{
+		{
+			// The exit-node case that was broken: a TUN is present and the
+			// node is advertising an exit node, so the hook must be consulted
+			// and the flow handed to netstack's forwardTCP.
+			name:          "TUNWithHookAllowing",
+			withTUN:       true,
+			hook:          func(src, dst netip.AddrPort) bool { return true },
+			wantIntercept: false,
+			wantHookCall:  true,
+		},
+		{
+			// A TUN is present but the node is not an exit node. The flow must
+			// still pass through to the host's own services (e.g. RDP :3389),
+			// so the return value is unchanged from the pre-fix behaviour.
+			name:          "TUNWithHookDeclining",
+			withTUN:       true,
+			hook:          func(src, dst netip.AddrPort) bool { return false },
+			wantIntercept: false,
+			wantHookCall:  true,
+		},
+		{
+			name:          "TUNWithoutHook",
+			withTUN:       true,
+			hook:          nil,
+			wantIntercept: false,
+			wantHookCall:  false,
+		},
+		{
+			// Userspace mode acting as an exit node: forwardTCP is the only
+			// path to the host, so declining to intercept is what relays it.
+			name:          "NoTUNWithHookAllowing",
+			withTUN:       false,
+			hook:          func(src, dst netip.AddrPort) bool { return true },
+			wantIntercept: false,
+			wantHookCall:  true,
+		},
+		{
+			// Userspace mode, not an exit node: strict default, RST the flow.
+			name:          "NoTUNWithHookDeclining",
+			withTUN:       false,
+			hook:          func(src, dst netip.AddrPort) bool { return false },
+			wantIntercept: true,
+			wantHookCall:  true,
+		},
+		{
+			name:          "NoTUNWithoutHook",
+			withTUN:       false,
+			hook:          nil,
+			wantIntercept: true,
+			wantHookCall:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			if tt.withTUN {
+				tunDev := newChanTUN()
+				defer tunDev.Close()
+				s.Tun = tunDev
+			}
+			var hookCalled bool
+			if tt.hook != nil {
+				s.ForwardUnclaimedTCP = func(gotSrc, gotDst netip.AddrPort) bool {
+					hookCalled = true
+					if gotSrc != src || gotDst != dst {
+						t.Errorf("hook got (%v, %v), want (%v, %v)", gotSrc, gotDst, src, dst)
+					}
+					return tt.hook(gotSrc, gotDst)
+				}
+			}
+
+			if got := s.unmatchedTCPFlowIntercept(src, dst); got != tt.wantIntercept {
+				t.Errorf("unmatchedTCPFlowIntercept() = %v, want %v", got, tt.wantIntercept)
+			}
+			if hookCalled != tt.wantHookCall {
+				t.Errorf("ForwardUnclaimedTCP called = %v, want %v (a hook that is never consulted is dead code)", hookCalled, tt.wantHookCall)
+			}
+		})
+	}
+}
