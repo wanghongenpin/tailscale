@@ -41,11 +41,12 @@ const featureName = "acme"
 
 // disabled is the build-time opt-out for the acme extension.
 // Set with -ldflags '-X tailscale.com/feature/acme.disabled=true'
-// (the meshpin-api Dockerfile does this). When true, init()
+// (the meshpin-api Dockerfile does this). When non-empty, init()
 // returns without registering anything, so the extension
 // never appears in `ipnext: active extensions: [...]` and
-// cannot block LocalBackend startup.
-var disabled bool
+// cannot block LocalBackend startup. String-typed because
+// `go tool link -X` only accepts string variables.
+var disabled string
 
 // init is normally the entry point that registers the acme
 // extension with the tailscale.com control plane. meshpin-api
@@ -78,7 +79,7 @@ var disabled bool
 // effect). The meshpin-api Dockerfile takes the former route
 // so the change lives in source control.
 func init() {
-	if disabled {
+	if disabled != "" {
 		return
 	}
 	feature.Register(featureName)
