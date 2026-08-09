@@ -1616,6 +1616,13 @@ func (s *Server) RegisterFallbackTCPHandler(cb FallbackTCPHandler) func() {
 //
 // It calls GetCertificate on the localClient, passing in the ClientHelloInfo.
 // For testing, if s.getCertForTesting is set, it will call that instead.
+//
+// Without the acme feature compiled in (ts_omit_acme build tag),
+// lc.GetCertificate isn't available — ListenTLS will fail loudly
+// at runtime, which is the right outcome for callers that want
+// ACME-managed certs. meshpin-api never calls ListenTLS (the
+// public-access gateway uses Dial, not Listen), so this branch
+// is a no-op for our use case.
 func (s *Server) getCert(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	lc, err := s.LocalClient()
 	if err != nil {
