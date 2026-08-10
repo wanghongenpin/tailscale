@@ -269,6 +269,12 @@ type Impl struct {
 	// This is currently only used in tests.
 	forwardDialFunc netx.DialFunc
 
+	// ForwardTCPDialTimeout bounds the outbound dial in forwardTCP.
+	// A zero value means no timeout — the dial uses a context that is
+	// only cancelled on client disconnect. Set by tsnet from
+	// tsnet.Server.ForwardTCPDialTimeout before Start.
+	ForwardTCPDialTimeout time.Duration
+
 	// forwardInFlightPerClientDropped is a metric that tracks how many
 	// in-flight TCP forward requests were dropped due to the per-client
 	// limit.
@@ -1737,6 +1743,11 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if ns.ForwardTCPDialTimeout > 0 {
+		var cancelTimeout context.CancelFunc
+		ctx, cancelTimeout = context.WithTimeout(ctx, ns.ForwardTCPDialTimeout)
+		defer cancelTimeout()
+	}
 
 	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.EventHUp) // TODO(bradfitz): right EventMask?
 	wq.EventRegister(&waitEntry)

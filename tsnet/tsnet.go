@@ -1107,13 +1107,37 @@ func (s *Server) start() (reterr error) {
 		return fmt.Errorf("starting backend: %w", err)
 	}
 	st := lb.State()
-	if st == ipn.NeedsLogin || envknob.Bool("TSNET_FORCE_LOGIN") {
-		s.logf("LocalBackend state is %v; running StartLoginInteractive...", st)
-		if err := s.lb.StartLoginInteractive(s.shutdownCtx); err != nil {
-			return fmt.Errorf("StartLoginInteractive: %w", err)
+	// tsnet v1.100 ships with a guard that immediately calls
+	// StartLoginInteractive whenever lb.State() is NeedsLogin, on
+	// the theory that any NeedsLogin state means the caller
+	// wants a human-driven flow. That's wrong when AuthKey is
+	// set: lb.Start() above already kicked off cc.Login(LoginDefault)
+	// with the auth key, and a NeedsLogin state at this point just
+	// means the control-plane handshake hasn't completed yet.
+	// StartLoginInteractive re-issues cc.Login(LoginInteractive),
+	// which drops the auth key on the floor and waits for a
+	// browser click — the exact failure mode for a headless
+	// server-side tsnet (meshpin-api's public-access gateway).
+	//
+	// meshpin fix: only call StartLoginInteractive when there is
+	// NO auth key, OR when the state is fully uninitialised
+	// (NoState — meaning StartLoginInteractive itself triggers
+	// the initial login). If AuthKey is set, trust lb.Start's
+	// cc.Login(LoginDefault) and let the caller (Up) wait for
+	// the Running state.
+	if authKey == "" {
+		if st == ipn.NeedsLogin || envknob.Bool("TSNET_FORCE_LOGIN") {
+			s.logf("LocalBackend state is %v; running StartLoginInteractive...", st)
+			if err := s.lb.StartLoginInteractive(s.shutdownCtx); err != nil {
+				return fmt.Errorf("StartLoginInteractive: %w", err)
+			}
 		}
-	} else if authKey != "" {
-		s.logf("Authkey is set; but state is %v. Ignoring authkey. Re-run with TSNET_FORCE_LOGIN=1 to force use of authkey.", st)
+	} else if st != ipn.NeedsLogin && st != ipn.Starting {
+		// AuthKey is set AND lb.Start's cc.Login has progressed
+		// past the NeedsLogin/Starting handshake — the auth key
+		// was accepted. Nothing to do.
+	} else {
+		s.logf("auth key set; state is %v, waiting for cc.Login(LoginDefault) to complete (Up will block until Running)", st)
 	}
 	go s.printAuthURLLoop()
 
@@ -1398,24 +1422,35 @@ func (s *Server) getTCPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 				return connHandler, intercept
 			}
 		}
-		// When a TUN device is present the caller has enabled
-		// CheckLocalTransportEndpoints, so returning (nil,
-		// false) lets unmatched flows pass through to the TUN
-		// device and reach the OS kernel's own services
-		// (e.g. Windows RDP on :3389). Without a TUN we must
-		// reject — there is no fallback path to the host.
-		if s.Tun != nil {
-			return nil, false
-		}
-		// ...except when acting as an exit node: netstack's forwardTCP
-		// is a path to the host, and relaying the peer's traffic out
-		// through it is the whole point. See ForwardUnclaimedTCP.
-		if s.ForwardUnclaimedTCP != nil && s.ForwardUnclaimedTCP(src, dst) {
-			return nil, false
-		}
-		return nil, true
+		return nil, s.unmatchedTCPFlowIntercept(src, dst)
 	}
 	return ln.handle, true
+}
+
+// unmatchedTCPFlowIntercept reports the intercept value [Server.getTCPHandlerForFlow]
+// should return for an inbound TCP flow that matched no listener and no fallback
+// handler.
+//
+// When a TUN device is present the caller has enabled
+// CheckLocalTransportEndpoints, so declining to intercept lets unmatched flows
+// pass through to the TUN device and reach the OS kernel's own services (e.g.
+// Windows RDP on :3389). Without a TUN there is no fallback path to the host, so
+// the flow must be intercepted (and RST'd)...
+//
+// ...except when acting as an exit node: netstack's forwardTCP is a path to the
+// host, and relaying the peer's traffic out through it is the whole point. See
+// [Server.ForwardUnclaimedTCP].
+//
+// The hook is evaluated before the s.Tun test rather than being short-circuited
+// by it: an `s.Tun != nil || hook(...)` expression would never call the hook on
+// a system-TUN platform (macOS, Windows), leaving the exit-node gate it
+// implements as dead code. Both conditions decline to intercept, so consulting
+// the hook here changes no return value — it just keeps the gate live.
+//
+// This is a meshpin-local addition, not upstream tailscale API.
+func (s *Server) unmatchedTCPFlowIntercept(src, dst netip.AddrPort) bool {
+	forwardAsExitNode := s.ForwardUnclaimedTCP != nil && s.ForwardUnclaimedTCP(src, dst)
+	return s.Tun == nil && !forwardAsExitNode
 }
 
 func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
@@ -1581,6 +1616,13 @@ func (s *Server) RegisterFallbackTCPHandler(cb FallbackTCPHandler) func() {
 //
 // It calls GetCertificate on the localClient, passing in the ClientHelloInfo.
 // For testing, if s.getCertForTesting is set, it will call that instead.
+//
+// Without the acme feature compiled in (ts_omit_acme build tag),
+// lc.GetCertificate isn't available — ListenTLS will fail loudly
+// at runtime, which is the right outcome for callers that want
+// ACME-managed certs. meshpin-api never calls ListenTLS (the
+// public-access gateway uses Dial, not Listen), so this branch
+// is a no-op for our use case.
 func (s *Server) getCert(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	lc, err := s.LocalClient()
 	if err != nil {

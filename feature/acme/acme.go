@@ -39,7 +39,49 @@ import (
 // featureName is the name of the feature implemented by this package.
 const featureName = "acme"
 
+// disabled is the build-time opt-out for the acme extension.
+// Set with -ldflags '-X tailscale.com/feature/acme.disabled=true'
+// (the meshpin-api Dockerfile does this). When non-empty, init()
+// returns without registering anything, so the extension
+// never appears in `ipnext: active extensions: [...]` and
+// cannot block LocalBackend startup. String-typed because
+// `go tool link -X` only accepts string variables.
+var disabled string
+
+// init is normally the entry point that registers the acme
+// extension with the tailscale.com control plane. meshpin-api
+// disables it because:
+//
+//   - The acme extension tries to obtain and rotate Let's Encrypt
+//     certs for `meshpin-gateway.<tailnet-domain>` on startup,
+//     which is useless in a headless server-side tsnet (no
+//     PeerAPI listeners exposed, no browser to complete the
+//     HTTP-01 challenge) and actively harmful — it blocks the
+//     LocalBackend init on cert refresh logic that never returns,
+//     so the gateway tsnet node sits in NeedsLogin forever.
+//
+//   - The cert management hooks (GetCertPEM, ACME TLS-ALPN,
+//     cert refresh loop) all live in this file. meshpin-api
+//     does NOT use them — the public-access gateway uses Dial,
+//     not Listen, so the cert plumbing never runs. Leaving the
+//     hooks installed is a no-op for meshpin-api, but the
+//     extension itself is what blocks startup.
+//
+// We keep the functions defined (so the package still
+// compiles and external callers that DO want acme keep
+// working) but make init() a no-op. The Go linker drops
+// the package from the binary if no symbol is reachable, so
+// this also shrinks the binary slightly.
+//
+// Disable by setting MESHPIN_NO_ACME=1 at build time (via the
+// Dockerfile -ldflags '-X ...acme.disabled=true' indirection or
+// just by deleting this init's body — both have the same
+// effect). The meshpin-api Dockerfile takes the former route
+// so the change lives in source control.
 func init() {
+	if disabled != "" {
+		return
+	}
 	feature.Register(featureName)
 	ipnext.RegisterExtension(featureName, newExtension)
 

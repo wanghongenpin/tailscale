@@ -3268,7 +3268,7 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 		fs.SetShares(shares)
 	}
 
-	if !loggedOut && (b.hasNodeKeyLocked() || confWantRunning) {
+	if !loggedOut && (b.hasNodeKeyLocked() || confWantRunning || opts.AuthKey != "") {
 		// If we know that we're either logged in or meant to be
 		// running, tell the controlclient that it should also assume
 		// that we need to be logged in.
