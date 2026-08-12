@@ -104,7 +104,6 @@ func (r *winRouter) Set(cfg *router.Config) error {
 
 	return nil
 }
-
 func hasDefaultRoute(routes []netip.Prefix) bool {
 	for _, route := range routes {
 		if route.Bits() == 0 {
@@ -123,6 +122,25 @@ func (r *winRouter) Close() error {
 
 	return nil
 }
+
+// Windows Firewall rule names, as they appear to the user in
+// wf.msc / "Windows Defender Firewall with Advanced Security".
+//
+// meshpin fork: rebranded from "Tailscale-In" / "Tailscale-Process" so a
+// commercial build shows no upstream branding. These are pure display
+// identifiers — netsh matches rules by this exact name, so the only
+// requirement is that every add/delete in this file uses the same
+// constant (they all do, and legacyFwRules below sweeps up entries left
+// by pre-rebrand builds).
+const (
+	fwRuleIn      = "MeshPin-In"
+	fwRuleProcess = "MeshPin-Process"
+)
+
+// legacyFwRules are rule names used by earlier builds. doSet deletes
+// them on every clear so upgraded devices don't accumulate orphaned
+// entries in the firewall UI that nothing else references.
+var legacyFwRules = []string{"Tailscale-In", "Tailscale-Process"}
 
 // firewallTweaker changes the Windows firewall. Normally this wouldn't be so complicated,
 // but it can be REALLY SLOW to change the Windows firewall for reasons not understood.
@@ -288,28 +306,36 @@ func (ft *firewallTweaker) doAsyncSet() {
 // Must only be invoked from doAsyncSet.
 func (ft *firewallTweaker) doSet(local []string, killswitch bool, clear bool, procRule bool, allowedRoutes []netip.Prefix) error {
 	if clear {
-		ft.logf("clearing Tailscale-In firewall rules...")
+		ft.logf("clearing %s firewall rules...", fwRuleIn)
 		// We ignore the error here, because netsh returns an error for
 		// deleting something that doesn't match.
 		// TODO(bradfitz): care? That'd involve querying it before/after to see
 		// whether it was necessary/worked. But the output format is localized,
 		// so can't rely on parsing English. Maybe need to use OLE, not netsh.exe?
-		d, _ := ft.runFirewall("delete", "rule", "name=Tailscale-In", "dir=in")
-		ft.logf("cleared Tailscale-In firewall rules in %v", d)
+		d, _ := ft.runFirewall("delete", "rule", "name="+fwRuleIn, "dir=in")
+		ft.logf("cleared %s firewall rules in %v", fwRuleIn, d)
+		// meshpin fork: also delete the pre-rebrand rule names. A device
+		// upgraded from a build that used "Tailscale-In" would otherwise
+		// keep those entries in the Windows Firewall UI forever — we no
+		// longer reference the old name anywhere, so nothing else would
+		// ever clean them up.
+		for _, legacy := range legacyFwRules {
+			ft.runFirewall("delete", "rule", "name="+legacy, "dir=in")
+		}
 	}
 	if procRule {
-		ft.logf("deleting any prior Tailscale-Process rule...")
-		d, err := ft.runFirewall("delete", "rule", "name=Tailscale-Process", "dir=in") // best effort
+		ft.logf("deleting any prior %s rule...", fwRuleProcess)
+		d, err := ft.runFirewall("delete", "rule", "name="+fwRuleProcess, "dir=in") // best effort
 		if err == nil {
-			ft.logf("removed old Tailscale-Process rule in %v", d)
+			ft.logf("removed old %s rule in %v", fwRuleProcess, d)
 		}
 		var exe string
 		exe, err = os.Executable()
 		if err != nil {
-			ft.logf("failed to find Executable for Tailscale-Process rule: %v", err)
+			ft.logf("failed to find Executable for %s rule: %v", fwRuleProcess, err)
 		} else {
-			ft.logf("adding Tailscale-Process rule to allow UDP for %q ...", exe)
-			d, err = ft.runFirewall("add", "rule", "name=Tailscale-Process",
+			ft.logf("adding %s rule to allow UDP for %q ...", fwRuleProcess, exe)
+			d, err = ft.runFirewall("add", "rule", "name="+fwRuleProcess,
 				"dir=in",
 				"action=allow",
 				"edge=yes",
@@ -319,24 +345,24 @@ func (ft *firewallTweaker) doSet(local []string, killswitch bool, clear bool, pr
 				"enable=yes",
 			)
 			if err != nil {
-				ft.logf("error adding Tailscale-Process rule: %v", err)
+				ft.logf("error adding %s rule: %v", fwRuleProcess, err)
 			} else {
 				ft.mu.Lock()
 				ft.didProcRule = true
 				ft.mu.Unlock()
-				ft.logf("added Tailscale-Process rule in %v", d)
+				ft.logf("added %s rule in %v", fwRuleProcess, d)
 			}
 		}
 	}
 	for _, cidr := range local {
-		ft.logf("adding Tailscale-In rule to allow %v ...", cidr)
+		ft.logf("adding %s rule to allow %v ...", fwRuleIn, cidr)
 		var d time.Duration
-		d, err := ft.runFirewall("add", "rule", "name=Tailscale-In", "dir=in", "action=allow", "localip="+cidr, "profile=private,domain", "enable=yes")
+		d, err := ft.runFirewall("add", "rule", "name="+fwRuleIn, "dir=in", "action=allow", "localip="+cidr, "profile=private,domain", "enable=yes")
 		if err != nil {
-			ft.logf("error adding Tailscale-In rule to allow %v: %v", cidr, err)
+			ft.logf("error adding %s rule to allow %v: %v", fwRuleIn, cidr, err)
 			return err
 		}
-		ft.logf("added Tailscale-In rule to allow %v in %v", cidr, d)
+		ft.logf("added %s rule to allow %v in %v", fwRuleIn, cidr, d)
 	}
 
 	if !killswitch {

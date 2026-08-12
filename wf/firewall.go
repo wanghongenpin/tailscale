@@ -93,9 +93,15 @@ type Firewall struct {
 }
 
 // New returns a new Firewall for the provided interface ID.
+//
+// meshpin fork: the Name fields below are rebranded from "Tailscale …".
+// They are display strings surfaced by `netsh wfp show state` and WFP
+// tooling, and are safe to change — the session, provider, and sublayer
+// are all keyed by freshly generated GUIDs (see GenerateGUID calls
+// below), never by name, so nothing matches on these strings.
 func New(luid uint64) (*Firewall, error) {
 	session, err := wf.New(&wf.Options{
-		Name:    "Tailscale firewall",
+		Name:    "MeshPin firewall",
 		Dynamic: true,
 	})
 	if err != nil {
@@ -108,7 +114,7 @@ func New(luid uint64) (*Firewall, error) {
 	providerID := wf.ProviderID(wguid)
 	if err := session.AddProvider(&wf.Provider{
 		ID:   providerID,
-		Name: "Tailscale provider",
+		Name: "MeshPin provider",
 	}); err != nil {
 		return nil, err
 	}
@@ -119,7 +125,7 @@ func New(luid uint64) (*Firewall, error) {
 	sublayerID := wf.SublayerID(wguid)
 	if err := session.AddSublayer(&wf.Sublayer{
 		ID:     sublayerID,
-		Name:   "Tailscale permissive and blocking filters",
+		Name:   "MeshPin permissive and blocking filters",
 		Weight: 0,
 	}); err != nil {
 		return nil, err

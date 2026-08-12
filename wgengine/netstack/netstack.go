@@ -269,12 +269,6 @@ type Impl struct {
 	// This is currently only used in tests.
 	forwardDialFunc netx.DialFunc
 
-	// ForwardTCPDialTimeout bounds the outbound dial in forwardTCP.
-	// A zero value means no timeout — the dial uses a context that is
-	// only cancelled on client disconnect. Set by tsnet from
-	// tsnet.Server.ForwardTCPDialTimeout before Start.
-	ForwardTCPDialTimeout time.Duration
-
 	// forwardInFlightPerClientDropped is a metric that tracks how many
 	// in-flight TCP forward requests were dropped due to the per-client
 	// limit.
