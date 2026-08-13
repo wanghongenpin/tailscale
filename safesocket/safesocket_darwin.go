@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,6 +72,15 @@ func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 	defer ssd.mu.Unlock()
 
 	switch {
+	case runtime.GOOS == "ios":
+		// The iOS NetworkExtension sandbox denies exec'ing lsof and the
+		// sameuserproof / macOS GUI credential mechanisms never apply there
+		// (meshpin talks to tsnet's in-process localapi directly). Falling
+		// through to portAndTokenFromSameUserProof would shell out to lsof
+		// on every local-api call, which the PacketTunnel sandbox denies and
+		// logs as kernel errors. Report no token so the caller just proceeds
+		// without Basic-Auth.
+		return 0, "", ErrTokenNotFound
 	case ssd.port != 0 && ssd.token != "":
 		// If something has explicitly set our credentials (typically non-standalone macos binary), use them.
 		return ssd.port, ssd.token, nil
