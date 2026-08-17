@@ -243,6 +243,20 @@ type Server struct {
 	// If unset, logs are discarded.
 	Logf logger.Logf
 
+	// DisableLogtail, if true, prevents the Server from creating the logtail
+	// uploader that ships backend logs to Tailscale's logging service. The
+	// on-disk log policy config (and therefore the node's log ID) is still
+	// loaded, so nothing else in the backend changes; only the network
+	// uploader and its local filch buffer are skipped.
+	//
+	// This is a meshpin-local addition to the vendored fork: logtail's
+	// Shutdown blocks for the full context deadline whenever an upload is
+	// in flight or retrying, which added a guaranteed multi-second stall to
+	// every Server.Close, and we do not want to ship backend logs to a
+	// third-party collector at all. Keep this field when rebasing onto a
+	// newer tailscale.com.
+	DisableLogtail bool
+
 	// Ephemeral, if true, specifies that the instance should register
 	// as an Ephemeral node (https://tailscale.com/s/ephemeral-nodes).
 	Ephemeral bool
@@ -1241,6 +1255,13 @@ func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker
 		return fmt.Errorf("logpolicy.Config.Validate for %v: %w", cfgPath, err)
 	}
 	s.logid = lpc.PublicID
+
+	if s.DisableLogtail {
+		// meshpin fork delta: keep the log ID (used by localapi and
+		// LocalBackend) but do not create the filch buffer or the logtail
+		// uploader. s.logtail stays nil; every use site is nil-guarded.
+		return nil
+	}
 
 	s.logbuffer, err = filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
 	if err != nil {
