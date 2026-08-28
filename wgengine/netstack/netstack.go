@@ -1617,6 +1617,15 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 		}
 		ep.SocketOptions().SetKeepAlive(true)
 
+		// meshpin addition: let the application bound this endpoint's send
+		// buffer by listening port. Applied here because this is the last point
+		// at which the endpoint is reachable — gonet.TCPConn keeps it
+		// unexported. See netstack_sendbuf.go for why a real-time stream wants
+		// a buffer far smaller than the stack default.
+		if n := tcpSendBufferSizeForPort(reqDetails.LocalPort); n > 0 {
+			ep.SocketOptions().SetSendBufferSize(n, true /* notify: clamp + disable auto-tuning */)
+		}
+
 		// This function is called when we're ready to use the
 		// underlying connection, and thus it's no longer in a
 		// "in-flight" state; decrement our per-client limit right now,
