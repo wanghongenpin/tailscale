@@ -4110,6 +4110,81 @@ func (c *Conn) DebugPickNewDERP() error {
 	return errors.New("too few regions")
 }
 
+// DebugFailoverDERP is the production counterpart of DebugPickNewDERP:
+// instead of a random region, it moves the DERP home to the lowest-latency
+// region OTHER than the current home, per the latest netcheck report, and
+// reports the new preference to control so peers reroute (senders connect to
+// the receiver's home region on demand, so this also hands the peer a fresh
+// relay TCP in the reverse direction).
+//
+// Meshpin fork addition. Triggered when the active relay path is degraded but
+// not dead — round-trip probes time out for tens of seconds while the
+// connection stays technically open, the state in which nothing reconnects
+// it (a hard death is what closeAllDerpLocked reacts to). The move is
+// intentionally temporary: the next netcheck report whose measured nearest
+// region differs switches the home back (maybeSetNearestDERP, force=false).
+//
+// Returns the new region ID.
+func (c *Conn) DebugFailoverDERP() (int, error) {
+	// Read the latency table without holding c.mu: RecentRegionLatency takes
+	// the netchecker's own lock, and taking it under c.mu would invent a lock
+	// ordering the rest of the file does not use.
+	lat := c.GetDERPRegionLatency()
+	c.mu.Lock()
+	dm := c.derpMap
+	if dm == nil {
+		c.mu.Unlock()
+		return 0, errors.New("no derpmap")
+	}
+	if c.netInfoLast == nil {
+		c.mu.Unlock()
+		return 0, errors.New("no netinfo")
+	}
+	current := c.myDerp
+
+	// Lowest measured latency among the other regions. Regions netcheck never
+	// reached carry no entry (or a zero duration), so they cannot win.
+	target := 0
+	best := time.Duration(1<<63 - 1)
+	for rid, d := range lat {
+		if rid == current || d <= 0 {
+			continue
+		}
+		if d < best {
+			best = d
+			target = rid
+		}
+	}
+	if target == 0 {
+		// No usable netcheck data for an alternative (UDP probing blocked,
+		// cold cache). Fall back to the first other region in the map, the
+		// same choice DebugPickNewDERP makes, rather than refusing to move.
+		for _, r := range dm.Regions {
+			if r.RegionID != current {
+				target = r.RegionID
+				break
+			}
+		}
+	}
+	if target == 0 {
+		c.mu.Unlock()
+		return 0, errors.New("too few regions")
+	}
+	if best == time.Duration(1<<63-1) {
+		c.logf("magicsock: failover: switching derp home from %v to %v (no netcheck latency data)",
+			current, target)
+	} else {
+		c.logf("magicsock: failover: switching derp home from %v to %v (alt latency %v)",
+			current, target, best)
+	}
+	go c.setNearestDERP(target)
+	ni2 := c.netInfoLast.Clone()
+	ni2.PreferredDERP = target
+	c.callNetInfoCallbackLocked(ni2)
+	c.mu.Unlock()
+	return target, nil
+}
+
 func (c *Conn) DebugForcePreferDERP(n int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

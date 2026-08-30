@@ -3959,6 +3959,15 @@ func (b *LocalBackend) DebugPickNewDERP() error {
 	return b.sys.MagicSock.Get().DebugPickNewDERP()
 }
 
+// DebugFailoverDERP forwards to magicsock.Conn.DebugFailoverDERP:
+// move the DERP home to the lowest-latency alternative region.
+// Meshpin fork addition: production escape hatch for a relay path that is
+// degraded but not dead (probes timing out while the connection stays open).
+// Returns the new region ID.
+func (b *LocalBackend) DebugFailoverDERP() (int, error) {
+	return b.sys.MagicSock.Get().DebugFailoverDERP()
+}
+
 // DebugForcePreferDERP forwards to netcheck.DebugForcePreferDERP.
 // See its docs.
 func (b *LocalBackend) DebugForcePreferDERP(n int) {

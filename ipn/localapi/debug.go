@@ -215,6 +215,14 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 		}
 	case "pick-new-derp":
 		err = h.b.DebugPickNewDERP()
+	case "failover-derp":
+		// Meshpin fork: deterministic home-region failover (lowest-latency
+		// alternative), used by deskstream's relay watchdog.
+		var region int
+		region, err = h.b.DebugFailoverDERP()
+		if err == nil {
+			io.WriteString(w, strconv.Itoa(region))
+		}
 	case "force-prefer-derp":
 		var n int
 		err = json.NewDecoder(r.Body).Decode(&n)
