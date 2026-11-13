@@ -79,10 +79,13 @@ var disabled string
 // effect). The meshpin-api Dockerfile takes the former route
 // so the change lives in source control.
 func init() {
+	// meshpin: MESHPIN_NO_ACME build-time kill switch (see comment above).
 	if disabled != "" {
 		return
 	}
-	feature.Register(featureName)
+	if !feature.Register(featureName) {
+		return
+	}
 	ipnext.RegisterExtension(featureName, newExtension)
 
 	ipnlocal.HookGetCertPEM.Set(getCertPEMHook)
